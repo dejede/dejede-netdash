@@ -5,8 +5,9 @@
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Status](https://img.shields.io/badge/status-stable-brightgreen)
 ![Auth](https://img.shields.io/badge/auth-session%20%2B%20CSRF-important)
-Loader LuCI sederhana untuk menampilkan dashboard PHP yang sudah ada di `/www/mwan3dash/index.php`.
 
+
+Loader LuCI sederhana untuk menampilkan dashboard PHP yang sudah ada di `/www/mwan3dash/index.php`.
 ## Konsep
 
 Project ini **tidak membuat ulang dashboard**. LuCI hanya menyediakan menu:
