@@ -8,6 +8,10 @@
 
 
 Loader LuCI sederhana untuk menampilkan dashboard PHP yang sudah ada di `/www/mwan3dash/index.php`.
+
+
+<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/7d7a6beb-5d7d-4754-8897-223a428e38d5" />
+
 ## Konsep
 
 Project ini **tidak membuat ulang dashboard**. LuCI hanya menyediakan menu:
@@ -53,9 +57,7 @@ Menu:
 
 ```text
 Services
-├── Dejede Explorer
-├── DEJEDE Network Dashboard
-└── Terminal
+└── DEJEDE Network Dashboard
 ```
 
 ## Cara kerja
