@@ -1,6 +1,6 @@
 # ⚡ DEJEDE Network Dashboard — OpenWrt 25.12.x
-[![Dejede Badge](https://img.shields.io/badge/DEJEDE_%7C_%2B6285236578999-5C765D?style=flat&logo=whatsapp&logoColor=white&labelColor=3F4F40)](https://wa.me/6285236578999)
 
+[![Dejede Badge](https://img.shields.io/badge/DEJEDE_%7C_%2B6285236578999-5C765D?style=flat&logo=whatsapp&logoColor=white&labelColor=3F4F40)](https://wa.me/6285236578999)
 ![OpenWrt](https://img.shields.io/badge/OpenWrt-24.x%20--%2025.x-1b4b34?logo=openwrt&logoColor=white)
 ![PHP](https://img.shields.io/badge/PHP-8.x-777bb4?logo=php&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-blue)
