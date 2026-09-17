@@ -16,143 +16,55 @@ if (file_exists($env_file)) {
 
 $telegram_token   = $_ENV['TELEGRAM_BOT_TOKEN'] ?? '';
 $telegram_chat_id = $_ENV['TELEGRAM_CHAT_ID'] ?? '';
-
-function dejede_format_kb($kb) {
-    $bytes = (float)$kb * 1024;
-    if ($bytes >= 1073741824) return round($bytes / 1073741824, 2) . ' GB';
-    if ($bytes >= 1048576) return round($bytes / 1048576, 1) . ' MB';
-    if ($bytes >= 1024) return round($bytes / 1024, 1) . ' KB';
-    return round($bytes) . ' B';
-}
-
-/* ------------------------------------------------------------
-   Default konfigurasi (dipakai jika config.php tidak ada /
-   tidak lengkap). interface_map menghubungkan interface LOGIKAL
-   (dipakai mwan3 & UI) ke nama device fisik di /proc/net/dev,
-   sesuai /etc/config/network:
-     wan1   -> device 'wan'
-     wan2   -> device 'lan2'
-     br-lan -> device 'br-lan'
-   ------------------------------------------------------------ */
-$refresh_interval_ms = 4000;
-$default_theme    = 'clean';
-$interface_labels = ['wan1' => 'WAN 1', 'wan2' => 'WAN 2', 'br-lan' => 'Bridge LAN'];
-$interface_map    = ['wan1' => 'wan', 'wan2' => 'lan2', 'br-lan' => 'br-lan'];
-
+$interface_labels = ['wan'=>'WAN 1','wan2'=>'WAN 2','br-lan'=>'Bridge LAN'];
 $config_path = __DIR__ . '/config.php';
 if (file_exists($config_path)) {
     $cfg = @include $config_path;
-    if (is_array($cfg)) {
-        if (isset($cfg['refresh_interval_ms']) && is_numeric($cfg['refresh_interval_ms'])) {
-            $refresh_interval_ms = (int)$cfg['refresh_interval_ms'];
-        }
-        if (!empty($cfg['default_theme'])) {
-            $default_theme = (string)$cfg['default_theme'];
-        }
-        if (isset($cfg['interface_labels']) && is_array($cfg['interface_labels'])) {
-            $interface_labels = array_merge($interface_labels, $cfg['interface_labels']);
-        }
-        if (isset($cfg['interface_map']) && is_array($cfg['interface_map'])) {
-            $interface_map = array_merge($interface_map, $cfg['interface_map']);
-        }
+    if (is_array($cfg) && isset($cfg['interface_labels']) && is_array($cfg['interface_labels'])) {
+        $interface_labels = array_merge($interface_labels, $cfg['interface_labels']);
     }
-}
-
-$allowed_themes = ['clean','robotic','cyberpunk','terminal','glass','gnome','light','nord','sunset','forest'];
-if (!in_array($default_theme, $allowed_themes, true)) {
-    $default_theme = 'clean';
 }
 
 /* ============================================================
    ENDPOINT AJAX: STATUS & TRAFIK SYSTEM (JSON)
    ============================================================ */
 if (isset($_GET['ajax']) && $_GET['ajax'] === 'status') {
+    $raw_mwan3 = @shell_exec('mwan3 status 2>/dev/null');
     $interfaces = [];
-    $debug_raw  = '';
 
-    // 1) Coba ubus dulu (JSON, jauh lebih stabil daripada parsing teks)
-    $raw_ubus  = @shell_exec('ubus -S call mwan3 status 2>/dev/null');
-    $ubus_data = $raw_ubus ? json_decode(trim($raw_ubus), true) : null;
+    if ($raw_mwan3) {
+        preg_match_all(
+            '/^\s*(\S+)\s*\(([^)]+)\):\s*interface is (\w+)(?:,\s*tracking (\w+))?.*?(\d+)\/(\d+)\/(\d+)%\s*packet loss on IPv4/m',
+            $raw_mwan3,
+            $matches,
+            PREG_SET_ORDER
+        );
 
-    if (is_array($ubus_data) && !empty($ubus_data['interfaces']) && is_array($ubus_data['interfaces'])) {
-        $debug_raw = $raw_ubus;
-        foreach ($ubus_data['interfaces'] as $iface_name => $info) {
-            $status = 'offline';
-            if (isset($info['status']) && is_string($info['status'])) {
-                $status = strtolower($info['status']);
-            } elseif (isset($info['up'])) {
-                $status = $info['up'] ? 'online' : 'offline';
-            }
-            $loss = 0;
-            foreach (['lost_percent', 'loss', 'packet_loss'] as $k) {
-                if (isset($info[$k]) && is_numeric($info[$k])) { $loss = (int)$info[$k]; break; }
-            }
+        foreach ($matches as $m) {
+            $iface_name = $m[1];
             $interfaces[] = [
                 'iface'    => $iface_name,
                 'label'    => $interface_labels[$iface_name] ?? $iface_name,
-                'status'   => $status,
-                'tracking' => isset($info['enabled']) ? ($info['enabled'] ? 'active' : '') : '',
-                'loss_now' => $loss,
-                'loss_avg' => $loss,
-                'loss_max' => $loss,
+                'status'   => $m[3],
+                'tracking' => isset($m[4]) ? $m[4] : '',
+                'loss_now' => (int)$m[5],
+                'loss_avg' => (int)$m[6],
+                'loss_max' => (int)$m[7],
             ];
-        }
-    }
-
-    // 2) Kalau ubus tidak ada / hasilnya kosong, fallback ke parsing teks "mwan3 status"
-    if (empty($interfaces)) {
-        $raw_mwan3 = @shell_exec('mwan3 status 2>/dev/null');
-        $debug_raw = $raw_mwan3 ?: $debug_raw;
-
-        if ($raw_mwan3) {
-            // Regex lengkap (format dengan baris "x/y/z% packet loss on IPv4")
-            preg_match_all(
-                '/^\s*(\S+)\s*\(([^)]+)\):\s*interface is (\w+)(?:,\s*tracking (\w+))?.*?(\d+)\/(\d+)\/(\d+)%\s*packet loss on IPv4/ms',
-                $raw_mwan3,
-                $matches,
-                PREG_SET_ORDER
-            );
-
-            // Regex cadangan: kalau format lengkap di atas tidak cocok dengan versi
-            // mwan3 router ini, cukup ambil nama interface + kata status-nya saja.
-            if (empty($matches)) {
-                preg_match_all(
-                    '/^\s*(\S+)\s*\(([^)]+)\):\s*interface is (\w+)/m',
-                    $raw_mwan3,
-                    $matches,
-                    PREG_SET_ORDER
-                );
-            }
-
-            foreach ($matches as $m) {
-                $iface_name = $m[1];
-                $interfaces[] = [
-                    'iface'    => $iface_name,
-                    'label'    => $interface_labels[$iface_name] ?? $iface_name,
-                    'status'   => $m[3],
-                    'tracking' => isset($m[4]) ? $m[4] : '',
-                    'loss_now' => isset($m[5]) ? (int)$m[5] : 0,
-                    'loss_avg' => isset($m[6]) ? (int)$m[6] : 0,
-                    'loss_max' => isset($m[7]) ? (int)$m[7] : 0,
-                ];
-            }
         }
     }
 
     $net_dev = @file_get_contents('/proc/net/dev');
     $traffic = [
-        'wan1'   => ['rx' => 0, 'tx' => 0], 
+        'wan'    => ['rx' => 0, 'tx' => 0], 
         'wan2'   => ['rx' => 0, 'tx' => 0], 
         'br-lan' => ['rx' => 0, 'tx' => 0]
     ];
     
     if ($net_dev) {
-        // Gunakan pemetaan dari config.php (interface_map) supaya sesuai
-        // dengan device fisik yang sedang aktif di /etc/config/network & mwan3.
-        foreach ($interface_map as $logical_key => $target_if) {
-            $quoted = preg_quote($target_if, '/');
-            if (preg_match('/^\s*' . $quoted . ':\s*(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\d+)/m', $net_dev, $match)) {
-                $traffic[$logical_key] = [
+        foreach (['wan', 'wan2', 'br-lan'] as $target_if) {
+            if (preg_match('/^\s*' . $target_if . ':\s*(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\d+)/m', $net_dev, $match)) {
+                $traffic[$target_if] = [
                     'rx' => (int)$match[1],
                     'tx' => (int)$match[2]
                 ];
@@ -171,29 +83,28 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'status') {
     }
 
     header('Content-Type: application/json');
-    $response = [
+    echo json_encode([
         'ok'          => true,
         'interfaces'  => $interfaces,
         'traffic'     => $traffic,
         'uptime'      => $uptime_formatted,
         'timestamp'   => microtime(true),
         'time_string' => date('H:i:s'),
-    ];
-    if (isset($_GET['debug'])) {
-        $response['debug_raw'] = $debug_raw;
-    }
-    echo json_encode($response);
+    ]);
     exit;
 }
 
 /* ============================================================
    DEJEDE NETMONITOR ENGINE
+   Direct kernel counters from /proc/net/dev.
+   On this router the real traffic interfaces are:
+   wan, wan2, br-lan.
    ============================================================ */
 if (isset($_GET['ajax']) && $_GET['ajax'] === 'netmonitor') {
     $state_file = '/tmp/dejede_netmonitor_state.json';
     $lock_file  = '/tmp/dejede_netmonitor_state.lock';
 
-    $logical_interfaces = array_keys($interface_map);
+    $logical_interfaces = ['wan', 'wan2', 'br-lan'];
 
     $net_dev = @file_get_contents('/proc/net/dev');
     $devices = [];
@@ -207,6 +118,8 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'netmonitor') {
             $dev = trim($m[1]);
             $v = preg_split('/\s+/', trim($m[2]));
 
+            // /proc/net/dev:
+            // RX = fields 0..7, TX = fields 8..15
             if (count($v) >= 16) {
                 $devices[$dev] = [
                     'rx_bytes'    => (float)$v[0],
@@ -238,13 +151,15 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'netmonitor') {
     }
 
     $dt = isset($state['_time']) ? ($now - (float)$state['_time']) : 0.0;
+
+    // First request establishes the baseline.
+    // Ignore abnormally long gaps so a stale browser tab doesn't create a spike.
     $valid_delta = ($dt >= 0.05 && $dt <= 5.0);
 
     $interfaces = [];
 
     foreach ($logical_interfaces as $logical) {
-        $dev_key = $interface_map[$logical] ?? $logical;
-        $cur = $devices[$dev_key] ?? null;
+        $cur = $devices[$logical] ?? null;
         $prev = $state[$logical] ?? null;
 
         if (!$cur) {
@@ -262,10 +177,14 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'netmonitor') {
         $rx_delta = 0.0;
         $tx_delta = 0.0;
 
-        if ($valid_delta && is_array($prev) && isset($prev['rx_bytes'], $prev['tx_bytes'])) {
+        if ($valid_delta && is_array($prev)
+            && isset($prev['rx_bytes'], $prev['tx_bytes'])) {
+
+            // Counter reset/restart protection.
             if ($cur['rx_bytes'] >= $prev['rx_bytes']) {
                 $rx_delta = $cur['rx_bytes'] - $prev['rx_bytes'];
             }
+
             if ($cur['tx_bytes'] >= $prev['tx_bytes']) {
                 $tx_delta = $cur['tx_bytes'] - $prev['tx_bytes'];
             }
@@ -340,16 +259,6 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'health') {
         }
     }
 
-    // Board ini (mis. MikroTik hEX RB750Gr3 / MT7621A) tidak punya sensor suhu
-    // yang di-expose OpenWrt, jadi $temp_c di atas akan selalu null. Sebagai
-    // pengganti, pakai frekuensi CPU aktif (selalu tersedia di MT7621) supaya
-    // card "System Load" tetap menampilkan sesuatu yang nyata, bukan "--°C".
-    $cpu_freq_mhz = null;
-    $freq_raw = @file_get_contents('/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq');
-    if ($freq_raw !== false && is_numeric(trim($freq_raw))) {
-        $cpu_freq_mhz = round(((float)trim($freq_raw)) / 1000);
-    }
-
     $gateway = '';
     $route = @shell_exec("ip -4 route show default 2>/dev/null | head -n 1");
     if ($route && preg_match('/default via ([0-9.]+)/', $route, $m)) $gateway = $m[1];
@@ -361,48 +270,6 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'health') {
     $loss = null;
     $raw_mwan3 = @shell_exec('mwan3 status 2>/dev/null');
     if ($raw_mwan3 && preg_match('/(\d+)\/(\d+)\/(\d+)%\s*packet loss on IPv4/m', $raw_mwan3, $m)) $loss = (int)$m[1];
-
-    /* --- Storage / Disk (partisi overlay, fallback ke root fs) --- */
-    $storage = ['used_percent' => null, 'used_human' => '--', 'total_human' => '--', 'mount' => '-'];
-    $df_raw = @shell_exec("df -P /overlay 2>/dev/null | tail -n 1");
-    if (!$df_raw || !preg_match('/\S+\s+\d+\s+\d+\s+\d+\s+\d+%\s+\S+/', trim($df_raw))) {
-        $df_raw = @shell_exec("df -P / 2>/dev/null | tail -n 1");
-    }
-    if ($df_raw && preg_match('/\S+\s+(\d+)\s+(\d+)\s+\d+\s+(\d+)%\s+(\S+)/', trim($df_raw), $m)) {
-        $storage = [
-            'used_percent' => (int)$m[3],
-            'used_human'   => dejede_format_kb((int)$m[2]),
-            'total_human'  => dejede_format_kb((int)$m[1]),
-            'mount'        => $m[4],
-        ];
-    }
-
-    /* --- Perangkat terhubung (DHCP leases aktif) --- */
-    $connected_devices = 0;
-    if (is_file('/tmp/dhcp.leases')) {
-        $lease_lines = @file('/tmp/dhcp.leases', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-        $connected_devices = $lease_lines ? count($lease_lines) : 0;
-    }
-
-    /* --- Load balance policy & bobot per interface (dari UCI mwan3) --- */
-    $lb_policy  = '';
-    $lb_weights = [];
-    $uci_mwan3 = @shell_exec('uci show mwan3 2>/dev/null');
-    if ($uci_mwan3) {
-        if (preg_match("/mwan3\.\S+\.use_policy='?([\w-]+)'?/", $uci_mwan3, $m)) {
-            $lb_policy = $m[1];
-        }
-        $member_iface = [];
-        if (preg_match_all("/mwan3\.(\w+)\.interface='?([\w-]+)'?/", $uci_mwan3, $mm, PREG_SET_ORDER)) {
-            foreach ($mm as $row) $member_iface[$row[1]] = $row[2];
-        }
-        if (preg_match_all("/mwan3\.(\w+)\.weight='?(\d+)'?/", $uci_mwan3, $mw, PREG_SET_ORDER)) {
-            foreach ($mw as $row) {
-                $iface = $member_iface[$row[1]] ?? $row[1];
-                $lb_weights[$iface] = (int)$row[2];
-            }
-        }
-    }
 
     $score = 100;
     if ($ping_ms === null) $score -= 35;
@@ -424,12 +291,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'health') {
         'load1' => $load1,
         'ram_percent' => round($mem_percent, 1),
         'temp_c' => $temp_c,
-        'cpu_freq_mhz' => $cpu_freq_mhz,
         'health_score' => max(0, min(100, $score)),
-        'storage' => $storage,
-        'connected_devices' => $connected_devices,
-        'lb_policy' => $lb_policy !== '' ? $lb_policy : 'N/A',
-        'lb_weights' => $lb_weights,
         'time_string' => date('H:i:s')
     ]);
     exit;
@@ -487,6 +349,7 @@ if (isset($_POST['action'])) {
     <title>Dejede - Network Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
+
 <style>
 :root{
     --bg:#181818;
@@ -505,6 +368,10 @@ if (isset($_POST['action'])) {
     --glow:0 0 0 transparent;
     --font:'Segoe UI',-apple-system,BlinkMacSystemFont,Roboto,sans-serif;
 }
+
+/* =========================================================
+   THEMES
+   ========================================================= */
 
 body[data-theme="gnome"]{
     --bg:#181818;
@@ -605,222 +472,874 @@ body[data-theme="light"]{
     --glow:0 8px 25px rgba(30,50,80,.07);
 }
 
-/* TEMA DEFAULT: latar bersih/minimalis, komponen & aksen berwarna-warni */
-body[data-theme="clean"]{
-    --bg:#f4f6fb;
-    --surface:#ffffff;
-    --surface2:#ffffff;
-    --border:rgba(15,23,42,.08);
-    --text:#111827;
-    --muted:#6b7280;
-    --accent:#2563eb;
-    --accent2:#7c3aed;
-    --success:#16a34a;
-    --warning:#d97706;
-    --danger:#dc2626;
-    --radius:14px;
-    --topbar:rgba(255,255,255,.92);
-    --glow:0 6px 22px rgba(15,23,42,.06);
+/* Background effects */
+
+body[data-theme="robotic"]::before,
+body[data-theme="terminal"]::before{
+    content:"";
+    position:fixed;
+    inset:0;
+    pointer-events:none;
+    z-index:-1;
+    background-image:
+        linear-gradient(rgba(34,230,233,.035) 1px,transparent 1px),
+        linear-gradient(90deg,rgba(34,230,233,.035) 1px,transparent 1px);
+    background-size:32px 32px;
 }
 
-body[data-theme="nord"]{
-    --bg:#2e3440;
-    --surface:rgba(216,222,233,.06);
-    --surface2:rgba(216,222,233,.10);
-    --border:rgba(216,222,233,.14);
-    --text:#eceff4;
-    --muted:#9aa5b1;
-    --accent:#88c0d0;
-    --accent2:#81a1c1;
-    --success:#a3be8c;
-    --warning:#ebcb8b;
-    --danger:#bf616a;
-    --radius:10px;
-    --topbar:rgba(46,52,64,.9);
-    --glow:0 8px 22px rgba(0,0,0,.18);
+body[data-theme="cyberpunk"]::before,
+body[data-theme="glass"]::before{
+    content:"";
+    position:fixed;
+    inset:-20%;
+    pointer-events:none;
+    z-index:-1;
+    background:
+        radial-gradient(
+            circle at 20% 15%,
+            rgba(255,48,185,.13),
+            transparent 30%
+        ),
+        radial-gradient(
+            circle at 80% 80%,
+            rgba(114,168,255,.12),
+            transparent 30%
+        );
+    filter:blur(20px);
 }
 
-body[data-theme="sunset"]{
-    --bg:#1a1025;
-    --surface:rgba(255,255,255,.05);
-    --surface2:rgba(255,255,255,.09);
-    --border:rgba(255,150,90,.18);
-    --text:#fff3e8;
-    --muted:#c9a6a0;
-    --accent:#ff7a59;
-    --accent2:#ffb84d;
-    --success:#5fd68a;
-    --warning:#ffcf5c;
-    --danger:#ff5c7a;
-    --radius:14px;
-    --topbar:rgba(26,16,37,.9);
-    --glow:0 0 26px rgba(255,122,89,.12);
+/* =========================================================
+   GLOBAL
+   ========================================================= */
+
+*,
+*::before,
+*::after{
+    box-sizing:border-box;
+    margin:0;
+    padding:0;
+    font-family:var(--font);
 }
 
-body[data-theme="forest"]{
-    --bg:#0f1712;
-    --surface:rgba(255,255,255,.04);
-    --surface2:rgba(255,255,255,.08);
-    --border:rgba(120,200,140,.18);
-    --text:#e8f5ea;
-    --muted:#8fae93;
-    --accent:#4caf6d;
-    --accent2:#8bd17c;
-    --success:#5fe38a;
-    --warning:#e3c15f;
-    --danger:#e35f6f;
-    --radius:12px;
-    --topbar:rgba(15,23,18,.9);
-    --glow:0 0 20px rgba(76,175,109,.10);
+html{
+    width:100%;
+    min-height:100%;
+    overflow-x:hidden;
 }
 
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; font-family: var(--font); }
-html { width: 100%; min-height: 100%; overflow-x: hidden; }
-body { background: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; transition: background .35s ease, color .35s ease; overflow-x: hidden; -webkit-font-smoothing: antialiased; }
-
-.topbar { height: 40px; min-height: 40px; background: var(--topbar); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; padding: 0 14px; position: sticky; top: 0; z-index: 100; }
-.topbar-brand { font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 6px; color: var(--text); white-space: nowrap; }
-.topbar-controls { display: flex; align-items: center; gap: 5px; }
-
-.gnome-btn { appearance: none; background: rgba(255,255,255,.06); border: 1px solid var(--border); color: var(--text); padding: 4px 9px; min-height: 26px; border-radius: 6px; font-size: 11px; font-weight: 500; cursor: pointer; transition: background .18s ease, border-color .18s ease, transform .15s ease; display: flex; align-items: center; justify-content: center; gap: 5px; white-space: nowrap; }
-.gnome-btn:hover { background: rgba(255,255,255,.12); transform: translateY(-1px); }
-.gnome-btn:active { transform: scale(.96); }
-.gnome-btn.danger { background: rgba(224,27,36,.15); border-color: rgba(224,27,36,.3); color: #ff7b7b; }
-.gnome-btn.danger:hover { background: rgba(224,27,36,.3); }
-.gnome-btn.tg { background: rgba(34,158,217,.15); border-color: rgba(34,158,217,.3); color: #4ac1f7; }
-.gnome-btn.tg:hover { background: rgba(34,158,217,.3); }
-
-.main-container { padding: 16px; max-width: 1100px; margin: 0 auto; width: 100%; flex: 1; display: flex; flex-direction: column; gap: 14px; }
-.header-status { display: flex; justify-content: space-between; align-items: center; background: var(--surface); border: 1px solid var(--border); padding: 10px 14px; border-radius: 10px; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); min-height: 42px; }
-.uptime-info { font-size: 12px; color: var(--muted); }
-
-.wan-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
-.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); display: flex; flex-direction: column; gap: 9px; box-shadow: var(--glow); transition: transform .22s ease, border-color .22s ease, background .22s ease; }
-.card:hover { transform: translateY(-1px); border-color: color-mix(in srgb, var(--accent) 28%, var(--border)); }
-.card-title { font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: space-between; min-height: 20px; }
-.metric-row { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--muted); line-height: 1.2; }
-.metric-val { color: var(--text); font-weight: 600; }
-
-.speedtest-box { display: flex; flex-direction: column; align-items: center; background: rgba(0,0,0,.16); padding: 8px; border-radius: 9px; border: 1px solid var(--border); width: 100%; overflow: hidden; }
-.speed-header-info { display: flex; justify-content: space-around; align-items: center; width: 100%; margin-bottom: 2px; text-align: center; }
-.speed-label-top { font-size: 9px; text-transform: uppercase; color: var(--muted); letter-spacing: .55px; display: block; }
-.speed-val-top { font-size: 13px; font-weight: 700; color: var(--success); line-height: 1.1; }
-
-.gauge-container { position: relative; width: 100%; max-width: 240px; aspect-ratio: 2 / 1; margin: 0 auto; display: flex; justify-content: center; align-items: center; }
-.gauge-canvas { width: 100% !important; height: auto !important; display: block; touch-action: none; }
-.gauge-digital-val { text-align: center; font-size: 20px; line-height: 1; font-weight: 700; color: var(--text); margin-top: -1px; letter-spacing: -.4px; }
-.gauge-digital-unit { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; text-align: center; margin-top: 2px; }
-
-.chart-card { width: 100%; }
-.chart-wrapper { position: relative; height: 200px; width: 100%; overflow: hidden; }
-
-.theme-picker { display: flex; align-items: center; gap: 3px; padding: 2px 5px; background: var(--surface2); border: 1px solid var(--border); border-radius: 7px; min-width: 0; }
-.theme-picker select { background: transparent; border: 0; outline: 0; color: var(--text); font-size: 11px; padding: 3px; cursor: pointer; max-width: 110px; }
-.theme-picker option { background: #15191d; color: #fff; }
-
-.status-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--success); box-shadow: 0 0 7px var(--success); margin-right: 4px; flex-shrink: 0; }
-
-/* Lampu bohlam status (berkedip saat online) */
-.status-badge{ display:inline-flex; align-items:center; gap:6px; font-size:10px; font-weight:700; letter-spacing:.3px; padding:3px 9px 3px 7px; border-radius:20px; background:rgba(255,255,255,.06); border:1px solid var(--border); white-space:nowrap; }
-.status-bulb{ position:relative; width:8px; height:8px; border-radius:50%; flex-shrink:0; background:var(--muted); }
-.status-bulb::after{ content:''; position:absolute; inset:-4px; border-radius:50%; background:inherit; opacity:.35; filter:blur(2px); }
-.status-bulb[data-state="online"]{ background:var(--success); box-shadow:0 0 6px var(--success), 0 0 14px var(--success); animation:bulbBlink 1.6s ease-in-out infinite; }
-.status-bulb[data-state="offline"]{ background:var(--danger); box-shadow:0 0 6px var(--danger); opacity:.7; animation:none; }
-.status-bulb[data-state="checking"]{ background:var(--warning); box-shadow:0 0 6px var(--warning); animation:bulbBlink .8s ease-in-out infinite; }
-@keyframes bulbBlink{
-    0%,100%{ opacity:1; filter:brightness(1.15); }
-    50%{ opacity:.4; filter:brightness(.8); }
+body{
+    background:var(--bg);
+    color:var(--text);
+    min-height:100vh;
+    display:flex;
+    flex-direction:column;
+    transition:
+        background .35s ease,
+        color .35s ease;
+    overflow-x:hidden;
+    -webkit-font-smoothing:antialiased;
 }
-.theme-hint { font-size: 9px; color: var(--muted); margin-top: 2px; }
 
-.modal-overlay { display: none; position: fixed; inset: 0; width: 100%; height: 100%; background: rgba(0,0,0,.5); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); z-index: 1000; align-items: center; justify-content: center; padding: 12px; }
-.modal-dialog { background: #242424; border: 1px solid var(--border); border-radius: 12px; width: 320px; max-width: 100%; padding: 20px; box-shadow: 0 15px 30px rgba(0,0,0,.4); text-align: center; }
-.modal-dialog h3 { font-size: 15px; margin-bottom: 8px; }
-.modal-dialog p { font-size: 12px; color: var(--muted); margin-bottom: 16px; }
-.modal-buttons { display: flex; gap: 8px; }
-.modal-buttons button { flex: 1; padding: 8px; border-radius: 6px; border: 1px solid var(--border); cursor: pointer; font-weight: 500; font-size: 12px; }
-.btn-cancel { background: rgba(255,255,255,.04); color: var(--text); }
-.btn-confirm { background: var(--accent); color: white; border: none; }
+/* =========================================================
+   TOPBAR
+   ========================================================= */
 
-.health-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
-.health-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; box-shadow: var(--glow); }
-.health-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; font-weight: 600; margin-bottom: 7px; }
-.health-card-head strong { font-size: 14px; color: var(--success); }
-.health-items { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
-.health-items > div { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.health-items span { font-size: 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
-.health-items b { font-size: 10px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.wan-extra { opacity: .82; }
-.chart-title-row { gap: 8px; }
-.chart-summary { font-size: 10px; color: var(--muted); white-space: nowrap; }
-.chart-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; font-size: 9px; color: var(--muted); }
-.chart-stats span { padding: 5px 7px; border: 1px solid var(--border); border-radius: 6px; background: rgba(0,0,0,.10); white-space: nowrap; }
-.chart-stats b { color: var(--text); font-weight: 600; }
+.topbar{
+    height:40px;
+    min-height:40px;
+    background:var(--topbar);
+    backdrop-filter:blur(16px);
+    -webkit-backdrop-filter:blur(16px);
+    border-bottom:1px solid var(--border);
+
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+
+    padding:0 14px;
+
+    position:sticky;
+    top:0;
+    z-index:100;
+}
+
+.topbar-brand{
+    font-weight:600;
+    font-size:13px;
+    display:flex;
+    align-items:center;
+    gap:6px;
+    color:var(--text);
+    white-space:nowrap;
+}
+
+.topbar-controls{
+    display:flex;
+    align-items:center;
+    gap:5px;
+}
+
+/* Buttons */
+
+.gnome-btn{
+    appearance:none;
+    background:rgba(255,255,255,.06);
+    border:1px solid var(--border);
+    color:var(--text);
+
+    padding:4px 9px;
+    min-height:26px;
+
+    border-radius:6px;
+
+    font-size:11px;
+    font-weight:500;
+
+    cursor:pointer;
+
+    transition:
+        background .18s ease,
+        border-color .18s ease,
+        transform .15s ease;
+
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    gap:5px;
+
+    white-space:nowrap;
+}
+
+.gnome-btn:hover{
+    background:rgba(255,255,255,.12);
+    transform:translateY(-1px);
+}
+
+.gnome-btn:active{
+    transform:scale(.96);
+}
+
+.gnome-btn.danger{
+    background:rgba(224,27,36,.15);
+    border-color:rgba(224,27,36,.3);
+    color:#ff7b7b;
+}
+
+.gnome-btn.danger:hover{
+    background:rgba(224,27,36,.3);
+}
+
+.gnome-btn.tg{
+    background:rgba(34,158,217,.15);
+    border-color:rgba(34,158,217,.3);
+    color:#4ac1f7;
+}
+
+.gnome-btn.tg:hover{
+    background:rgba(34,158,217,.3);
+}
+
+/* =========================================================
+   MAIN
+   ========================================================= */
+
+.main-container{
+    padding:16px;
+    max-width:1100px;
+    margin:0 auto;
+    width:100%;
+    flex:1;
+
+    display:flex;
+    flex-direction:column;
+    gap:14px;
+}
+
+/* =========================================================
+   HEADER STATUS
+   ========================================================= */
+
+.header-status{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+
+    background:var(--surface);
+    border:1px solid var(--border);
+
+    padding:10px 14px;
+
+    border-radius:10px;
+
+    backdrop-filter:blur(8px);
+    -webkit-backdrop-filter:blur(8px);
+
+    min-height:42px;
+}
+
+.uptime-info{
+    font-size:12px;
+    color:var(--muted);
+}
+
+/* =========================================================
+   WAN GRID
+   ========================================================= */
+
+.wan-grid{
+    display:grid;
+    grid-template-columns:repeat(2,minmax(0,1fr));
+    gap:14px;
+}
+
+/* =========================================================
+   CARD
+   ========================================================= */
+
+.card{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+
+    padding:14px;
+
+    backdrop-filter:blur(12px);
+    -webkit-backdrop-filter:blur(12px);
+
+    display:flex;
+    flex-direction:column;
+    gap:9px;
+
+    box-shadow:var(--glow);
+
+    transition:
+        transform .22s ease,
+        border-color .22s ease,
+        background .22s ease;
+}
+
+.card:hover{
+    transform:translateY(-1px);
+    border-color:color-mix(
+        in srgb,
+        var(--accent) 28%,
+        var(--border)
+    );
+}
+
+.card-title{
+    font-size:13px;
+    font-weight:600;
+
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+
+    min-height:20px;
+}
+
+.metric-row{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+
+    font-size:11px;
+    color:var(--muted);
+
+    line-height:1.2;
+}
+
+.metric-val{
+    color:var(--text);
+    font-weight:600;
+}
+
+/* =========================================================
+   SPEEDTEST
+   ========================================================= */
+
+.speedtest-box{
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+
+    background:rgba(0,0,0,.16);
+
+    padding:8px;
+
+    border-radius:9px;
+    border:1px solid var(--border);
+
+    width:100%;
+
+    overflow:hidden;
+}
+
+.speed-header-info{
+    display:flex;
+    justify-content:space-around;
+    align-items:center;
+
+    width:100%;
+
+    margin-bottom:2px;
+
+    text-align:center;
+}
+
+.speed-label-top{
+    font-size:9px;
+    text-transform:uppercase;
+
+    color:var(--muted);
+
+    letter-spacing:.55px;
+
+    display:block;
+}
+
+.speed-val-top{
+    font-size:13px;
+    font-weight:700;
+    color:var(--success);
+
+    line-height:1.1;
+}
+
+/* =========================================================
+   GAUGE
+   ========================================================= */
+
+.gauge-container{
+    position:relative;
+
+    width:100%;
+    max-width:240px;
+
+    aspect-ratio:2 / 1;
+
+    margin:0 auto;
+
+    display:flex;
+    justify-content:center;
+    align-items:center;
+}
+
+.gauge-canvas{
+    width:100% !important;
+    height:auto !important;
+
+    display:block;
+
+    /* prevent accidental touch/selection delay */
+    touch-action:none;
+}
+
+.gauge-digital-val{
+    text-align:center;
+
+    font-size:20px;
+    line-height:1;
+
+    font-weight:700;
+
+    color:var(--text);
+
+    margin-top:-1px;
+
+    letter-spacing:-.4px;
+}
+
+.gauge-digital-unit{
+    font-size:9px;
+
+    color:var(--muted);
+
+    text-transform:uppercase;
+    letter-spacing:.6px;
+
+    text-align:center;
+
+    margin-top:2px;
+}
+
+/* =========================================================
+   LAN CHART
+   ========================================================= */
+
+.chart-card{
+    width:100%;
+}
+
+.chart-wrapper{
+    position:relative;
+
+    height:200px;
+    width:100%;
+
+    overflow:hidden;
+}
+
+/* =========================================================
+   THEME PICKER
+   ========================================================= */
+
+.theme-picker{
+    display:flex;
+    align-items:center;
+    gap:3px;
+
+    padding:2px 5px;
+
+    background:var(--surface2);
+    border:1px solid var(--border);
+
+    border-radius:7px;
+
+    min-width:0;
+}
+
+.theme-picker select{
+    background:transparent;
+    border:0;
+    outline:0;
+
+    color:var(--text);
+
+    font-size:11px;
+
+    padding:3px;
+
+    cursor:pointer;
+
+    max-width:110px;
+}
+
+.theme-picker option{
+    background:#15191d;
+    color:#fff;
+}
+
+/* =========================================================
+   STATUS
+   ========================================================= */
+
+.status-dot{
+    display:inline-block;
+
+    width:7px;
+    height:7px;
+
+    border-radius:50%;
+
+    background:var(--success);
+
+    box-shadow:
+        0 0 7px var(--success);
+
+    margin-right:4px;
+
+    flex-shrink:0;
+}
+
+.theme-hint{
+    font-size:9px;
+    color:var(--muted);
+
+    margin-top:2px;
+}
+
+/* =========================================================
+   MODAL
+   ========================================================= */
+
+.modal-overlay{
+    display:none;
+
+    position:fixed;
+    inset:0;
+
+    width:100%;
+    height:100%;
+
+    background:rgba(0,0,0,.5);
+
+    backdrop-filter:blur(4px);
+    -webkit-backdrop-filter:blur(4px);
+
+    z-index:1000;
+
+    align-items:center;
+    justify-content:center;
+
+    padding:12px;
+}
+
+.modal-dialog{
+    background:#242424;
+
+    border:1px solid var(--border);
+
+    border-radius:12px;
+
+    width:320px;
+    max-width:100%;
+
+    padding:20px;
+
+    box-shadow:
+        0 15px 30px rgba(0,0,0,.4);
+
+    text-align:center;
+}
+
+.modal-dialog h3{
+    font-size:15px;
+    margin-bottom:8px;
+}
+
+.modal-dialog p{
+    font-size:12px;
+    color:var(--muted);
+    margin-bottom:16px;
+}
+
+.modal-buttons{
+    display:flex;
+    gap:8px;
+}
+
+.modal-buttons button{
+    flex:1;
+
+    padding:8px;
+
+    border-radius:6px;
+
+    border:1px solid var(--border);
+
+    cursor:pointer;
+
+    font-weight:500;
+    font-size:12px;
+}
+
+.btn-cancel{
+    background:rgba(255,255,255,.04);
+    color:var(--text);
+}
+
+.btn-confirm{
+    background:var(--accent);
+    color:white;
+    border:none;
+}
+
+/* =========================================================
+   V4 HEALTH / STATS
+   ========================================================= */
+.health-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.health-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 12px;box-shadow:var(--glow)}
+.health-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;font-weight:600;margin-bottom:7px}
+.health-card-head strong{font-size:14px;color:var(--success)}
+.health-items{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
+.health-items>div{min-width:0;display:flex;flex-direction:column;gap:2px}
+.health-items span{font-size:8px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+.health-items b{font-size:10px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wan-extra{opacity:.82}
+.chart-title-row{gap:8px}
+.chart-summary{font-size:10px;color:var(--muted);white-space:nowrap}
+.chart-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;font-size:9px;color:var(--muted)}
+.chart-stats span{padding:5px 7px;border:1px solid var(--border);border-radius:6px;background:rgba(0,0,0,.10);white-space:nowrap}
+.chart-stats b{color:var(--text);font-weight:600}
+
+/* =========================================================
+   TABLET
+   ========================================================= */
 
 @media (max-width:768px){
-    .health-grid { grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: 7px; } .health-card { padding: 8px 9px; } .health-items { gap: 5px; } .chart-stats { gap: 4px; } .chart-stats span { padding: 4px 5px; }
-    .main-container { padding: 9px; gap: 9px; }
-    .topbar { height: 36px; min-height: 36px; padding: 0 9px; }
-    .topbar-brand { font-size: 11px; }
-    .gnome-btn { padding: 3px 7px; min-height: 24px; font-size: 10px; }
-    .wan-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-    .card { padding: 9px; gap: 7px; border-radius: 9px; }
-    .chart-wrapper { height: 155px; }
+    .health-grid{gap:7px}.health-card{padding:8px 9px}.health-items{gap:5px}.chart-stats{gap:4px}.chart-stats span{padding:4px 5px}
+
+    .main-container{
+        padding:9px;
+        gap:9px;
+    }
+
+    .topbar{
+        height:36px;
+        min-height:36px;
+        padding:0 9px;
+    }
+
+    .topbar-brand{
+        font-size:11px;
+    }
+
+    .topbar-controls{
+        gap:4px;
+    }
+
+    .gnome-btn{
+        padding:3px 7px;
+        min-height:24px;
+        font-size:10px;
+    }
+
+    .header-status{
+        min-height:38px;
+        padding:8px 10px;
+        border-radius:8px;
+    }
+
+    .uptime-info{
+        font-size:10px;
+    }
+
+    .wan-grid{
+        grid-template-columns:repeat(2,minmax(0,1fr));
+        gap:8px;
+    }
+
+    .card{
+        padding:9px;
+        gap:7px;
+        border-radius:9px;
+    }
+
+    .card-title{
+        font-size:11px;
+        min-height:17px;
+    }
+
+    .metric-row{
+        font-size:9px;
+    }
+
+    .speedtest-box{
+        padding:5px;
+        border-radius:7px;
+    }
+
+    .speed-label-top{
+        font-size:8px;
+        letter-spacing:.35px;
+    }
+
+    .speed-val-top{
+        font-size:11px;
+    }
+
+    .gauge-container{
+        max-width:100%;
+        width:100%;
+    }
+
+    .gauge-digital-val{
+        font-size:16px;
+    }
+
+    .gauge-digital-unit{
+        font-size:8px;
+    }
+
+    .chart-wrapper{
+        height:155px;
+    }
+
+    .theme-picker{
+        padding:1px 3px;
+    }
+
+    .theme-picker select{
+        font-size:9px;
+        max-width:75px;
+        padding:2px;
+    }
 }
+
+/* =========================================================
+   SMALL PHONE
+   ========================================================= */
 
 @media (max-width:480px){
-    .health-grid { grid-template-columns: repeat(auto-fit, minmax(108px, 1fr)); gap: 5px; } .health-card { padding: 7px; } .health-card-head { font-size: 9px; margin-bottom: 5px; } .health-card-head strong { font-size: 12px; } .health-items { gap: 4px; } .health-items span { font-size: 7px; } .health-items b { font-size: 8px; } .chart-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); font-size: 8px; }
-    .main-container { padding: 6px; gap: 6px; }
-    .topbar { height: 34px; min-height: 34px; padding: 0 7px; }
-    .chart-wrapper { height: 135px; }
-    .status-badge { padding: 2px 7px 2px 5px; gap: 4px; font-size: 9px; }
-    .status-bulb { width: 6px; height: 6px; }
+    .health-grid{gap:5px}.health-card{padding:7px}.health-card-head{font-size:9px;margin-bottom:5px}.health-card-head strong{font-size:12px}.health-items{gap:4px}.health-items span{font-size:7px}.health-items b{font-size:8px}.chart-stats{grid-template-columns:repeat(2,minmax(0,1fr));font-size:8px}
+
+    .main-container{
+        padding:6px;
+        gap:6px;
+    }
+
+    .topbar{
+        height:34px;
+        min-height:34px;
+        padding:0 7px;
+    }
+
+    .topbar-brand{
+        font-size:10px;
+        gap:4px;
+    }
+
+    .topbar-controls{
+        gap:3px;
+    }
+
+    .gnome-btn{
+        min-height:22px;
+        padding:2px 5px;
+        font-size:9px;
+        border-radius:5px;
+    }
+
+    .header-status{
+        padding:6px 8px;
+        min-height:34px;
+        border-radius:7px;
+    }
+
+    .uptime-info{
+        font-size:9px;
+    }
+
+    .wan-grid{
+        gap:6px;
+    }
+
+    .card{
+        padding:7px;
+        gap:5px;
+        border-radius:8px;
+    }
+
+    .card-title{
+        font-size:10px;
+    }
+
+    .metric-row{
+        font-size:8px;
+    }
+
+    .metric-val{
+        font-size:9px;
+    }
+
+    .speedtest-box{
+        padding:3px;
+        border-radius:6px;
+    }
+
+    .speed-header-info{
+        margin-bottom:0;
+    }
+
+    .speed-label-top{
+        font-size:7px;
+    }
+
+    .speed-val-top{
+        font-size:10px;
+    }
+
+    .gauge-container{
+        width:100%;
+        max-width:none;
+    }
+
+    .gauge-digital-val{
+        font-size:14px;
+    }
+
+    .gauge-digital-unit{
+        font-size:7px;
+        letter-spacing:.4px;
+    }
+
+    .chart-wrapper{
+        height:135px;
+    }
+
+    .theme-picker select{
+        max-width:65px;
+        font-size:8px;
+    }
 }
 
-/* Mobile sangat kecil / tampilan lebih tipis (thin) */
-@media (max-width:380px){
-    .main-container { padding: 5px; gap: 5px; }
-    .topbar { height: 32px; min-height: 32px; padding: 0 6px; }
-    .topbar-brand { font-size: 10px; gap: 4px; }
-    .gnome-btn { padding: 2px 6px; min-height: 22px; font-size: 9px; }
-    .theme-picker select { max-width: 78px; font-size: 10px; }
-    .wan-grid { gap: 5px; }
-    .card { padding: 6px; gap: 5px; border-radius: 8px; }
-    .card-title { font-size: 11px; min-height: 16px; }
-    .metric-row { font-size: 9px; }
-    .speedtest-box { padding: 5px; gap: 1px; }
-    .speed-val-top { font-size: 11px; }
-    .gauge-digital-val { font-size: 16px; }
-    .health-grid { grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); gap: 4px; }
-    .health-card { padding: 5px; }
-    .chart-wrapper { height: 110px; }
-    .status-badge { padding: 1px 6px 1px 4px; font-size: 8px; }
+/* =========================================================
+   EXTRA SMALL PHONE
+   ========================================================= */
+
+@media (max-width:360px){
+
+    .main-container{
+        padding:5px;
+        gap:5px;
+    }
+
+    .wan-grid{
+        gap:5px;
+    }
+
+    .card{
+        padding:6px;
+    }
+
+    .card-title{
+        font-size:9px;
+    }
+
+    .metric-row{
+        font-size:7.5px;
+    }
+
+    .speed-val-top{
+        font-size:9px;
+    }
+
+    .gauge-digital-val{
+        font-size:13px;
+    }
+
+    .gnome-btn{
+        padding:2px 4px;
+        font-size:8px;
+    }
 }
 
-/* Layar besar (desktop) - tampilan lebih maksimal & lega */
-@media (min-width:1200px){
-    .main-container { max-width: 1480px; padding: 22px; gap: 18px; }
-    .topbar { height: 48px; min-height: 48px; padding: 0 22px; }
-    .topbar-brand { font-size: 15px; }
-    .gnome-btn { padding: 6px 14px; min-height: 32px; font-size: 12px; }
-    .header-status { padding: 14px 20px; }
-    .health-grid { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
-    .health-card { padding: 16px 18px; }
-    .health-items { gap: 10px; }
-    .wan-grid { gap: 20px; }
-    .card { padding: 20px; gap: 14px; }
-    .card-title { font-size: 15px; }
-    .gauge-container { max-width: 300px; }
-    .gauge-digital-val { font-size: 26px; }
-    .chart-wrapper { height: 280px; }
-    .chart-stats span { padding: 7px 10px; font-size: 11px; }
+/* =========================================================
+   TOUCH DEVICE
+   ========================================================= */
+
+@media (hover:none){
+
+    .card:hover{
+        transform:none;
+    }
+
+    .gnome-btn:hover{
+        transform:none;
+    }
+
+    .gnome-btn:active{
+        background:rgba(255,255,255,.14);
+    }
 }
 
-@media (min-width:1600px){
-    .main-container { max-width: 1700px; }
-    .wan-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+/* =========================================================
+   REDUCE MOTION
+   ========================================================= */
+
+@media (prefers-reduced-motion:reduce){
+
+    *,
+    *::before,
+    *::after{
+        scroll-behavior:auto !important;
+        transition-duration:.01ms !important;
+        animation-duration:.01ms !important;
+    }
 }
 </style>
+
 </head>
 <body>
 
@@ -832,16 +1351,12 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; display: fl
             <div class="theme-picker" title="Pilih tema dashboard">
                 <span>🎨</span>
                 <select id="themeSelect" onchange="setTheme(this.value)" aria-label="Pilih tema">
-                    <option value="clean">CLEAN</option>
-                    <option value="light">LIGHT</option>
-                    <option value="gnome">GNOME</option>
-                    <option value="glass">GLASS</option>
-                    <option value="nord">NORD</option>
-                    <option value="sunset">SUNSET</option>
-                    <option value="forest">FOREST</option>
                     <option value="robotic">ROBOTIC</option>
                     <option value="cyberpunk">CYBERPUNK</option>
                     <option value="terminal">TERMINAL</option>
+                    <option value="glass">GLASS</option>
+                    <option value="gnome">GNOME</option>
+                    <option value="light">LIGHT</option>
                 </select>
             </div>
             <button class="gnome-btn tg" onclick="sendTelegramReport()" title="Kirim Laporan">📤 Telegram</button>
@@ -854,10 +1369,11 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; display: fl
         <div class="header-status">
             <div>
                 <h2 style="font-size: 15px; font-weight: 600;">System Overview</h2>
-                <span class="uptime-info" id="uptimeText">Memuat informasi...</span><div class="theme-hint"><span class="status-dot"></span><span id="themeName">CLEAN</span> interface</div>
+                <span class="uptime-info" id="uptimeText">Memuat informasi...</span><div class="theme-hint"><span class="status-dot"></span><span id="themeName">ROBOTIC</span> interface</div>
             </div>
             <div id="lastUpdate" style="font-size: 11px; color: var(--muted);">Sync...</div>
         </div>
+
         
         <div class="health-grid">
             <div class="health-card">
@@ -869,49 +1385,22 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; display: fl
                 </div>
             </div>
             <div class="health-card">
-                <div class="health-card-head"><span>⚙ System Load</span><strong id="tempValue">--</strong></div>
+                <div class="health-card-head"><span>⚙ System Load</span><strong id="tempValue">--°C</strong></div>
                 <div class="health-items">
                     <div><span>CPU Load</span><b id="cpuLoadValue">--</b></div>
                     <div><span>RAM</span><b id="ramValue">--</b></div>
                     <div><span>Monitor</span><b id="healthSync">WAIT</b></div>
                 </div>
             </div>
-            <div class="health-card">
-                <div class="health-card-head"><span>💾 Storage</span><strong id="storagePercent">--%</strong></div>
-                <div class="health-items">
-                    <div><span>Terpakai</span><b id="storageUsed">--</b></div>
-                    <div><span>Total</span><b id="storageTotal">--</b></div>
-                    <div><span>Partisi</span><b id="storageMount">--</b></div>
-                </div>
-            </div>
-            <div class="health-card">
-                <div class="health-card-head"><span>📶 Perangkat</span><strong id="deviceCount">--</strong></div>
-                <div class="health-items">
-                    <div><span>DHCP Aktif</span><b id="deviceCountText">--</b></div>
-                    <div><span>Interface</span><b>br-lan</b></div>
-                    <div><span>Sumber</span><b>dhcp.leases</b></div>
-                </div>
-            </div>
-            <div class="health-card">
-                <div class="health-card-head"><span>⚖ Load Balance</span><strong id="lbPolicy">--</strong></div>
-                <div class="health-items">
-                    <div><span>WAN1 Weight</span><b id="lbWan1Weight">--</b></div>
-                    <div><span>WAN2 Weight</span><b id="lbWan2Weight">--</b></div>
-                    <div><span>Mode</span><b id="lbMode">--</b></div>
-                </div>
-            </div>
         </div>
 
-        <!-- WAN 1 (wan1) & WAN 2 (wan2) -->
+        <!-- WAN 1 dan WAN 2 Saja (2 Kolom Pas Tanpa Area Kosong) -->
         <div class="wan-grid">
             <!-- WAN 1 Card -->
             <div class="card">
                 <div class="card-title">
-                    <span>🌐 WAN 1 (wan1)</span>
-                    <span class="status-badge">
-                        <span class="status-bulb" id="wan1Bulb" data-state="checking"></span>
-                        <span id="wan1Status">CHECKING</span>
-                    </span>
+                    <span>🌐 WAN 1</span>
+                    <span id="wan1Status" style="font-size: 10px; padding: 2px 6px; border-radius: 8px; background: rgba(46,194,126,0.2); color: var(--success);">ONLINE</span>
                 </div>
                 <div class="metric-row"><span>Packet Loss:</span> <span class="metric-val" id="wan1Loss">0%</span></div>
                 <div class="metric-row wan-extra"><span>RX/TX Packets:</span> <span class="metric-val" id="wan1Packets">-- / --</span></div>
@@ -938,11 +1427,8 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; display: fl
             <!-- WAN 2 Card -->
             <div class="card">
                 <div class="card-title">
-                    <span>🌐 WAN 2 (wan2)</span>
-                    <span class="status-badge">
-                        <span class="status-bulb" id="wan2Bulb" data-state="checking"></span>
-                        <span id="wan2Status">CHECKING</span>
-                    </span>
+                    <span>🌐 WAN 2</span>
+                    <span id="wan2Status" style="font-size: 10px; padding: 2px 6px; border-radius: 8px; background: rgba(246,211,45,0.2); color: var(--warning);">CHECKING</span>
                 </div>
                 <div class="metric-row"><span>Packet Loss:</span> <span class="metric-val" id="wan2Loss">0%</span></div>
                 <div class="metric-row wan-extra"><span>RX/TX Packets:</span> <span class="metric-val" id="wan2Packets">-- / --</span></div>
@@ -967,7 +1453,7 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; display: fl
             </div>
         </div>
 
-        <!-- Grafik Trafik (Bridge LAN) -->
+        <!-- Grafik Trafik (Bridge LAN) Diletakkan Rapi di Bawah Full Width -->
         <div class="card chart-card">
             <div class="card-title chart-title-row">
                 <span>📈 Grafik Trafik Real-Time (Bridge LAN)</span>
@@ -997,16 +1483,11 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; display: fl
     </div>
 
     <script>
-        // Konfigurasi dari config.php (server-side) diteruskan ke JS
-        const DEJEDE_CONFIG = <?php echo json_encode([
-            'refreshIntervalMs' => $refresh_interval_ms,
-            'defaultTheme'      => $default_theme,
-        ], JSON_UNESCAPED_SLASHES); ?>;
 
         function getCSS(name){return getComputedStyle(document.body).getPropertyValue(name).trim();}
         function setTheme(theme){
-            const allowed=['clean','robotic','cyberpunk','terminal','glass','gnome','light','nord','sunset','forest'];
-            if(!allowed.includes(theme)) theme=DEJEDE_CONFIG.defaultTheme || 'clean';
+            const allowed=['robotic','cyberpunk','terminal','glass','gnome','light'];
+            if(!allowed.includes(theme)) theme='robotic';
             document.body.dataset.theme=theme;
             localStorage.setItem('dejede-theme',theme);
             const s=document.getElementById('themeSelect'); if(s)s.value=theme;
@@ -1021,7 +1502,7 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; display: fl
             }
         }
         (function(){
-            const t=localStorage.getItem('dejede-theme')||DEJEDE_CONFIG.defaultTheme||'clean';
+            const t=localStorage.getItem('dejede-theme')||'robotic';
             document.body.dataset.theme=t;
             window.addEventListener('DOMContentLoaded',function(){
                 setTheme(t);
@@ -1029,7 +1510,9 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; display: fl
         })();
 
         let currentActionType = '';
+        let prevData = null;
         let healthBusy = false;
+        
         let gaugeAnim = {
             wan1: { current: 0, target: 0 },
             wan2: { current: 0, target: 0 }
@@ -1045,6 +1528,9 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; display: fl
             const canvas = document.getElementById(canvasId);
             if (!canvas) return;
 
+            /* Keep the original 220x115 drawing geometry, but render the
+               backing canvas at device-pixel resolution so desktop scaling
+               stays sharp. Do not stretch the drawing coordinates. */
             const logicalWidth = 220;
             const logicalHeight = 115;
             const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 3));
@@ -1107,6 +1593,8 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; display: fl
                 ctx.fillText(val, tx, ty);
             });
 
+            // Needle starts pointing left at 0 Mbps.
+            // Canvas 0 rad points right; Math.PI points left.
             ctx.save();
             ctx.translate(cx, cy);
             ctx.rotate(activeAngle);
@@ -1211,7 +1699,6 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; display: fl
             const el=document.getElementById(id); if(!el)return;
             el.textContent=value; el.style.color=good?'var(--text)':'var(--danger)';
         }
-
         async function fetchHealthData(){
             if(healthBusy)return; healthBusy=true;
             try{
@@ -1226,56 +1713,9 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; display: fl
                 setHealthText('cpuLoadValue',load.toFixed(2),load<1.5);
                 setHealthText('ramValue',ram.toFixed(1)+'%',ram<80);
                 const temp=h.temp_c===null?null:Number(h.temp_c);
-                const freq=(h.cpu_freq_mhz===null||h.cpu_freq_mhz===undefined)?null:Number(h.cpu_freq_mhz);
-                const tempEl=document.getElementById('tempValue');
-                if(tempEl){
-                    if(temp!==null){
-                        tempEl.textContent=temp.toFixed(0)+'°C';
-                        tempEl.style.color=temp<75?'var(--success)':'var(--danger)';
-                    } else if(freq!==null){
-                        tempEl.textContent=freq+' MHz';
-                        tempEl.style.color='var(--text)';
-                    } else {
-                        // Board tanpa sensor suhu maupun cpufreq (mis. RB750Gr3/MT7621
-                        // tanpa scaling) -> tampilkan status beban CPU dari load average,
-                        // ini selalu tersedia di semua perangkat Linux/OpenWrt.
-                        let label='NORMAL', color='var(--success)';
-                        if(load>=2.0){ label='TINGGI'; color='var(--danger)'; }
-                        else if(load>=1.0){ label='SEDANG'; color='var(--warning)'; }
-                        tempEl.textContent=label;
-                        tempEl.style.color=color;
-                    }
-                }
+                setHealthText('tempValue',temp===null?'--°C':temp.toFixed(0)+'°C',temp===null||temp<75);
                 const sync=document.getElementById('healthSync');
                 if(sync){sync.textContent=h.time_string||'OK';sync.style.color='var(--success)'}
-
-                // Storage
-                const st=h.storage||{};
-                const stPct=st.used_percent===null||st.used_percent===undefined?null:Number(st.used_percent);
-                const spEl=document.getElementById('storagePercent');
-                if(spEl){spEl.textContent=stPct===null?'--%':stPct+'%';spEl.style.color=stPct===null?'var(--text)':(stPct<80?'var(--success)':(stPct<92?'var(--warning)':'var(--danger)'))}
-                setHealthText('storageUsed', st.used_human||'--');
-                setHealthText('storageTotal', st.total_human||'--');
-                setHealthText('storageMount', st.mount||'-');
-
-                // Perangkat terhubung
-                const devCount=Number(h.connected_devices)||0;
-                const dcEl=document.getElementById('deviceCount');
-                if(dcEl)dcEl.textContent=devCount;
-                setHealthText('deviceCountText', devCount+' perangkat');
-
-                // Load balance policy
-                const w=h.lb_weights||{};
-                const w1=w.wan1!==undefined?w.wan1:null, w2=w.wan2!==undefined?w.wan2:null;
-                const lbEl=document.getElementById('lbPolicy');
-                if(lbEl)lbEl.textContent=(h.lb_policy||'N/A').toString().toUpperCase();
-                setHealthText('lbWan1Weight', w1===null?'--':w1);
-                setHealthText('lbWan2Weight', w2===null?'--':w2);
-                let mode='--';
-                if(w1!==null && w2!==null){
-                    mode = (w1===w2) ? 'Seimbang' : (w1>w2 ? 'Prioritas WAN1' : 'Prioritas WAN2');
-                }
-                setHealthText('lbMode', mode);
             }catch(e){
                 const sync=document.getElementById('healthSync');
                 if(sync){sync.textContent='ERROR';sync.style.color='var(--danger)'}
@@ -1284,6 +1724,7 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; display: fl
 
         async function fetchDashboardData() {
             try {
+                // Status/loss tetap memakai endpoint status lama.
                 const statusRes = await fetch('?ajax=status', { cache: 'no-store' });
                 const data = await statusRes.json();
 
@@ -1291,31 +1732,28 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; display: fl
                 document.getElementById('lastUpdate').textContent = 'Sync: ' + data.time_string;
 
                 if (data.interfaces && data.interfaces.length > 0) {
-                    const applyStatus = (prefix, iface) => {
-                        const label = document.getElementById(prefix + 'Status');
-                        const bulb  = document.getElementById(prefix + 'Bulb');
-                        const state = iface.status === 'online' ? 'online' : 'offline';
-                        if (label) label.textContent = iface.status.toUpperCase();
-                        if (bulb) bulb.dataset.state = state;
-                    };
                     data.interfaces.forEach(iface => {
-                        if (iface.iface === 'wan1') {
+                        if (iface.iface === 'wan') {
                             document.getElementById('wan1Loss').textContent = iface.loss_now + '%';
-                            applyStatus('wan1', iface);
-                        } 
-                        else if (iface.iface === 'wan2') {
+                            const b = document.getElementById('wan1Status');
+                            b.textContent = iface.status.toUpperCase();
+                            b.style.color = iface.status === 'online' ? 'var(--success)' : 'var(--danger)';
+                        } else if (iface.iface === 'wan2') {
                             document.getElementById('wan2Loss').textContent = iface.loss_now + '%';
-                            applyStatus('wan2', iface);
+                            const b = document.getElementById('wan2Status');
+                            b.textContent = iface.status.toUpperCase();
+                            b.style.color = iface.status === 'online' ? 'var(--success)' : 'var(--danger)';
                         }
                     });
                 }
 
+                // DEJEDE NetMonitor: backend sudah menghitung RX/TX Mbps.
                 const nmRes = await fetch('?ajax=netmonitor', { cache: 'no-store' });
                 const nm = await nmRes.json();
 
                 if (!nm.ok || !nm.interfaces) return;
 
-                const wan1 = nm.interfaces.wan1 || {};
+                const wan1 = nm.interfaces.wan || {};
                 const wan2 = nm.interfaces.wan2 || {};
                 const lan  = nm.interfaces['br-lan'] || {};
 
@@ -1328,18 +1766,19 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; display: fl
                 document.getElementById('wan1TxText').textContent = wan1Tx.toFixed(2) + ' Mbps';
                 document.getElementById('wan1Digital').textContent = wan1Rx.toFixed(2);
                 gaugeAnim.wan1.target = wan1Rx;
-                document.getElementById('wan1Packets').textContent = (Number(wan1.rx_packets)||0).toLocaleString()+' / '+(Number(wan1.tx_packets)||0).toLocaleString();
+                 document.getElementById('wan1Packets').textContent=(Number(wan1.rx_packets)||0).toLocaleString()+' / '+(Number(wan1.tx_packets)||0).toLocaleString();
 
                 document.getElementById('wan2RxText').textContent = wan2Rx.toFixed(2) + ' Mbps';
                 document.getElementById('wan2TxText').textContent = wan2Tx.toFixed(2) + ' Mbps';
                 document.getElementById('wan2Digital').textContent = wan2Rx.toFixed(2);
                 gaugeAnim.wan2.target = wan2Rx;
-                document.getElementById('wan2Packets').textContent = (Number(wan2.rx_packets)||0).toLocaleString()+' / '+(Number(wan2.tx_packets)||0).toLocaleString();
+                 document.getElementById('wan2Packets').textContent=(Number(wan2.rx_packets)||0).toLocaleString()+' / '+(Number(wan2.tx_packets)||0).toLocaleString();
 
                 if (lan.rx_bytes !== undefined) {
                     document.getElementById('lanTotalText').textContent = 'Total: ' + formatBytes(Number(lan.rx_bytes) || 0);
                 }
 
+                // Chart memakai throughput yang sudah dihitung engine.
                 const lanRx = Math.max(0, Number(lan.rx_mbps) || 0);
                 const lanTx = Math.max(0, Number(lan.tx_mbps) || 0);
 
@@ -1352,16 +1791,14 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; display: fl
                 trafficChart.data.labels.push(nm.time_string || new Date().toLocaleTimeString());
                 trafficChart.data.datasets[0].data.push(lanRx);
                 trafficChart.data.datasets[1].data.push(lanTx);
-                
-                const combined = trafficChart.data.datasets[0].data.concat(trafficChart.data.datasets[1].data);
-                const peak = combined.length ? Math.max(...combined) : 0;
-                const avg = combined.length ? combined.reduce((a,b)=>a+b,0)/combined.length : 0;
-                
-                document.getElementById('lanRxNow').textContent = lanRx.toFixed(2);
-                document.getElementById('lanTxNow').textContent = lanTx.toFixed(2);
-                document.getElementById('lanPeak').textContent = peak.toFixed(2);
-                document.getElementById('lanAvg').textContent = avg.toFixed(2);
-                trafficChart.update('none');
+                const combined=trafficChart.data.datasets[0].data.concat(trafficChart.data.datasets[1].data);
+                 const peak=combined.length?Math.max(...combined):0;
+                 const avg=combined.length?combined.reduce((a,b)=>a+b,0)/combined.length:0;
+                 document.getElementById('lanRxNow').textContent=lanRx.toFixed(2);
+                 document.getElementById('lanTxNow').textContent=lanTx.toFixed(2);
+                 document.getElementById('lanPeak').textContent=peak.toFixed(2);
+                 document.getElementById('lanAvg').textContent=avg.toFixed(2);
+                 trafficChart.update('none');
 
             } catch (e) {
                 console.error('Gagal memuat DEJEDE NetMonitor:', e);
@@ -1374,11 +1811,10 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; display: fl
             dashboardBusy = true;
             try { await fetchDashboardData(); } finally { dashboardBusy = false; }
         }
-        
         fetchDashboardData();
         fetchHealthData();
         setInterval(dashboardLoop, 300);
-        setInterval(fetchHealthData, Math.max(1000, DEJEDE_CONFIG.refreshIntervalMs || 4000));
+        setInterval(fetchHealthData, 3000);
     </script>
 </body>
 </html>
